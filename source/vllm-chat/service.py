@@ -16,6 +16,8 @@ from annotated_types import Ge, Le
 from bento_constants import CONSTANT_YAML
 from fastapi.responses import FileResponse
 from typing_extensions import Annotated, Literal
+from pathlib import Path
+from bentoml.validators import ContentType
 
 
 class Message(pydantic.BaseModel):
