@@ -10,7 +10,7 @@ CONSTANT_YAML = """
       gpu: 1
       gpu_type: nvidia-rtx-3060
   engine_config:
-    model: Qwen/Qwen2-7B-Instruct-AWQ
+    model: model/
     max_model_len: 2048
     quantization: awq
 """

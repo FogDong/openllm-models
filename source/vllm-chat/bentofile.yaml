@@ -12,8 +12,21 @@ include:
 - "bentovllm_openai/*.py"
 - "chat_templates/chat_templates/*.jinja"
 - "chat_templates/generation_configs/*.json"
+- "model/*"
 python:
   requirements_txt: "./requirements.txt"
   lock_packages: true
 envs:
-  - name: HF_TOKEN
+  - name: SNOWFLAKE_ACCOUNT
+  - name: SNOWFLAKE_USER
+  - name: SNOWFLAKE_PASSWORD
+  - name: SNOWFLAKE_DATABASE
+    value: "BENTOML_DEMO"
+  - name: SNOWFLAKE_WAREHOUSE
+    value: "BENTOML_WAREHOUSE"
+  - name: SNOWFLAKE_SCHEMA
+    value: "PUBLIC"
+  - name: SNOWFLAKE_ROLE
+    value: "ACCOUNTADMIN"
+  - name: SNOWFLAKE_STAGE
+    value: "docs"
