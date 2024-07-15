@@ -222,6 +222,18 @@ class VLLM:
             logger.error(f"Error in chat API: {e}")
             yield f"Error in chat API: {e}"
 
+    @bentoml.api(route="/api/snowflake_chat")
+    async def snowflake_chat(
+        self,
+        data: list = [[0, "what is the meaning of life?"]],
+     ):
+        messages = [Message(content=item[1], role="user") for item in data]
+        res = self.chat(messages=messages)
+        content = ""
+        for r in res:
+            content += r
+        return {"data": [[0, content]]}    
+        
 
 @functools.lru_cache(maxsize=1)
 def _get_gen_config(community_chat_template: str) -> dict:
@@ -239,156 +251,3 @@ def _get_gen_config(community_chat_template: str) -> dict:
         chat_template = f.read()
     gen_config["template"] = chat_template.replace("    ", "").replace("\n", "")
     return gen_config
-
-
-@bentoml.service(
-    name="rag",
-    resources={"memory": "2Gi"}
-)
-class RAG:
-    llm = bentoml.depends(VLLM)
-
-    def __init__(self):
-        self.snowflake_config = {
-            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-            "user": os.getenv("SNOWFLAKE_USER"),
-            "password": os.getenv("SNOWFLAKE_PASSWORD"),
-            "database": os.getenv("SNOWFLAKE_DATABASE"),
-            "schema": os.getenv("SNOWFLAKE_SCHEMA"),
-            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
-            "role": os.getenv("SNOWFLAKE_ROLE"),
-            "stage": os.getenv("SNOWFLAKE_STAGE"),
-        }
-        from snowflake.snowpark import Session
-
-        self.session = Session.builder.configs(self.snowflake_config).create()
-
-    def create_system_prompt(self, myquestion: str) -> tuple[str, list[str], list[str]]:
-
-        cmd = """
-        with results as
-        (SELECT RELATIVE_PATH,
-        VECTOR_COSINE_SIMILARITY(docs_chunks_table.chunk_vec,
-                    bentoml_sentence_transformer(?)) as similarity,
-        chunk
-        from docs_chunks_table
-        order by similarity desc
-        limit ?)
-        select chunk, relative_path from results 
-        """
-        num_chunks = 3
-        
-        df_context = self.session.sql(cmd, params=[myquestion, num_chunks]).to_pandas()
-
-        current_length = 0
-        max_length = 500
-        prompt_context = ""
-        relative_paths = []
-        for i in range(0, len(df_context)):
-            relative_paths.append(df_context._get_value(i, "RELATIVE_PATH"))
-
-            chunk = df_context._get_value(i, "CHUNK")
-            chunk_length = len(chunk)
-            if current_length + chunk_length > max_length:
-                prompt_context += chunk[: max_length - current_length]
-                break
-            else:
-                prompt_context += chunk
-                current_length += chunk_length
-
-        prompt = f"""
-        'You are an expert assistance extracting information from context provided. 
-        Answer the question based on the context. Be concise and do not hallucinate. 
-        If you don´t have the information just say so.
-        Context: {prompt_context}
-        """
-
-        cmd2 = f"""
-        WITH relative_paths AS (
-          SELECT
-            value AS relative_path
-          FROM
-            TABLE(FLATTEN(INPUT => {relative_paths}))
-        )
-        SELECT
-          GET_PRESIGNED_URL(@docs, rp.relative_path, 360) AS URL_LINK
-        FROM
-          relative_paths rp
-        """
-
-        df_url_link = self.session.sql(cmd2).to_pandas()
-        url_links = []
-        for i in range(0, len(df_url_link)):
-            url_links.append(df_url_link._get_value(i, "URL_LINK"))
-
-        return prompt, url_links, relative_paths
-    
-            
-    @bentoml.api
-    async def rag_chat(
-        self,
-        message: str = "Is there any special lubricant to be used with the premium bike?",
-        max_tokens: Annotated[
-            int,
-            Ge(128),
-            Le(ENGINE_CONFIG["max_model_len"]),
-        ] = ENGINE_CONFIG["max_model_len"],
-    ) -> AsyncGenerator[str, None]:
-        system_prompt, url_links, relative_paths = self.create_system_prompt(message)
-        reference = ""
-        for i in range(0, len(relative_paths)):
-            reference += f"* [{relative_paths[i]}]({url_links[i]})\n"
-        prompt = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": message},
-        ]
-        try:
-            async for text in self.llm.chat(
-                messages=prompt,
-                max_tokens=max_tokens,
-            ):
-                yield text
-            if reference:
-                yield f"\nHere are some references for you:\n{reference}"
-        except Exception as e:
-            error_message = traceback.format_exc()
-            yield f"An error occurred: {e}\n\n{error_message}"
-
-    @bentoml.api
-    async def upload_pdf(self, file: Annotated[Path, ContentType("application/pdf")]) -> str:
-        try:
-            stage = f"{self.snowflake_config['database']}.{self.snowflake_config['schema']}.{self.snowflake_config['stage']}"
-            put_command = f"PUT file://{file} @{stage} AUTO_COMPRESS=FALSE"
-            result = self.session.sql(put_command).collect()
-            upload_info = result[0]
-            target_file = upload_info['target']
-            
-            refresh_command = f"ALTER STAGE {stage} REFRESH"
-            refresh_res = self.session.sql(refresh_command).collect()
-            print("Refresh result: ", refresh_res)
-            
-            try:
-                chunk_command= f"""
-                INSERT INTO docs_chunks_table (relative_path, size, file_url,
-                                            scoped_file_url, chunk, chunk_vec)
-                    SELECT 
-                        dir.relative_path, 
-                        dir.size,
-                        dir.file_url, 
-                        build_scoped_file_url(@{stage}, dir.relative_path) AS scoped_file_url,
-                        func.chunk AS chunk,
-                        bentoml_sentence_transformer(func.chunk) AS chunk_vec
-                    FROM 
-                        (SELECT * FROM directory(@{stage}) WHERE relative_path = '{target_file}') AS dir,
-                        TABLE(pdf_text_chunker(build_scoped_file_url(@{stage}, dir.relative_path))) AS func;
-                """
-                res = self.session.sql(chunk_command).collect()
-                print("Chunking result: ", res)
-            except Exception as e:
-                error_message = traceback.format_exc()
-                return f"Failed to chunk pdf: {e}\n\n{error_message}"
-            
-            return f"File {file.name} uploaded and chunked successfully."
-        except Exception as e:
-            error_message = traceback.format_exc()
-            return f"Failed to upload pdf: {e}\n\n{error_message}"
